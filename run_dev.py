@@ -9,14 +9,17 @@ import webbrowser
 
 os.environ['AMP_DEV'] = '1'  # libera todos os módulos no Hub
 
-from app import app, db, User
+from app import app, db, User, _auto_migrate, _backfill_mensalidades, _backfill_sync_fields
 
 PORT = 5000
 
 
 def _seed():
     with app.app_context():
+        _auto_migrate()
         db.create_all()
+        _backfill_mensalidades()
+        _backfill_sync_fields()
         admin = User.query.filter_by(username='admin').first()
         if not admin:
             u = User(username='admin', role='adm', perms='aulas,ranking,comandas')

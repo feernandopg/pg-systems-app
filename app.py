@@ -1,8 +1,15 @@
 import os
+import re
 import sys
+import calendar
+import socket
+import uuid
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, redirect, url_for, send_from_directory, abort
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event
+from sqlalchemy.orm import declared_attr
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -95,6 +102,10 @@ class User(UserMixin, db.Model):
     role = db.Column(db.String(20), nullable=True, default='user')   # 'adm' vê tudo; 'user' segue perms
     perms = db.Column(db.String(200), nullable=True, default='')     # csv de módulos liberados
     photo = db.Column(db.String(200), nullable=True)                 # nome do arquivo em uploads/
+    # colunas de sync (usuários sincronizam pro login na nuvem) — ver PLANO_ACESSO_REMOTO.md
+    sync_uid = db.Column(db.String(36), index=True)
+    updated_at = db.Column(db.String(26))
+    deleted_at = db.Column(db.String(26), nullable=True)
     def set_password(self, p): self.password_hash = generate_password_hash(p)
     def check_password(self, p): return check_password_hash(self.password_hash, p)
     @property
@@ -111,7 +122,22 @@ class Setting(db.Model):
     key = db.Column(db.String(50), primary_key=True)
     value = db.Column(db.Text, nullable=True)
 
-class ClassSession(db.Model):
+class SyncMixin:
+    """Colunas de sincronização (Fase de acesso remoto). São ADITIVAS: os ids
+    autoincrement continuam iguais; o `sync_uid` (UUID) é a identidade estável
+    entre PC e nuvem. Carimbadas automaticamente por eventos (ver _stamp_sync).
+    Ver PLANO_ACESSO_REMOTO.md."""
+    @declared_attr
+    def sync_uid(cls):
+        return db.Column(db.String(36), index=True)
+    @declared_attr
+    def updated_at(cls):
+        return db.Column(db.String(26))     # 'YYYY-MM-DD HH:MM:SS.ffffff' (microssegundos)
+    @declared_attr
+    def deleted_at(cls):
+        return db.Column(db.String(26), nullable=True)  # soft-delete (usado na Fase de sync)
+
+class ClassSession(SyncMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     day = db.Column(db.String(20), nullable=False)
     time = db.Column(db.String(10), nullable=False)
@@ -125,13 +151,13 @@ class ClassSession(db.Model):
             'students': [{'id': s.id, 'name': s.name} for s in self.students]
         }
 
-class Replacement(db.Model):
+class Replacement(SyncMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('student.id'), nullable=False)
     created_at = db.Column(db.String(10), nullable=False)
     expires_at = db.Column(db.String(10), nullable=False)
 
-class StudentHistory(db.Model):
+class StudentHistory(SyncMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('student.id'), nullable=False)
     description = db.Column(db.String(200), nullable=False)
@@ -139,8 +165,10 @@ class StudentHistory(db.Model):
     action_type = db.Column(db.String(30), nullable=True, default='info')
     credit_delta = db.Column(db.Integer, nullable=True, default=0)
 
-class ActivityLog(db.Model):
-    """Registro geral de tudo que acontece no ecossistema (auditoria global)."""
+class ActivityLog(SyncMixin, db.Model):
+    """Registro geral de tudo que acontece no ecossistema (auditoria global).
+    Sincroniza PC↔nuvem: assim o dono vê no 'Atividades' o que a funcionária fez
+    pelo celular (e vice-versa)."""
     id = db.Column(db.Integer, primary_key=True)
     system = db.Column(db.String(20), nullable=True, default='aulas')     # aulas/comandas/ranking/config
     category = db.Column(db.String(20), nullable=False, default='info')  # presenca/falta/reposicao/pagamento/aluno/turma/matricula/exclusao/...
@@ -162,7 +190,35 @@ class ActivityLog(db.Model):
             'datetime': self.created_at,
         }
 
-class Student(db.Model):
+class Mensalidade(SyncMixin, db.Model):
+    """Uma parcela mensal do plano do aluno. Cada mês do plano vira uma linha.
+    O status (paga/vencida/a vencer) é DERIVADO de pago_em + vencimento — nunca
+    guardado, pra não ficar dessincronizado."""
+    id = db.Column(db.Integer, primary_key=True)
+    student_id = db.Column(db.Integer, db.ForeignKey('student.id'), nullable=False)
+    ciclo = db.Column(db.Integer, nullable=False, default=1)   # 1 = plano original; +1 a cada renovação
+    numero = db.Column(db.Integer, nullable=False, default=1)  # nº da parcela dentro do ciclo
+    mes_ref = db.Column(db.String(7), nullable=False)          # 'YYYY-MM' (competência)
+    vencimento = db.Column(db.String(10), nullable=False)      # 'YYYY-MM-DD'
+    valor = db.Column(db.Float, nullable=False, default=0.0)
+    pago_em = db.Column(db.String(10), nullable=True)          # 'YYYY-MM-DD' quando paga
+
+    def status(self, today_iso=None):
+        if self.pago_em:
+            return 'paga'
+        if today_iso is None:
+            today_iso = datetime.now().strftime('%Y-%m-%d')
+        return 'vencida' if self.vencimento < today_iso else 'a_vencer'
+
+    def to_dict(self, today_iso=None):
+        return {
+            'id': self.id, 'ciclo': self.ciclo, 'numero': self.numero,
+            'mesRef': self.mes_ref, 'vencimento': self.vencimento,
+            'valor': self.valor, 'pagoEm': self.pago_em,
+            'status': self.status(today_iso),
+        }
+
+class Student(SyncMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
     plan = db.Column(db.String(20), nullable=False)
@@ -182,24 +238,51 @@ class Student(db.Model):
     history_logs = db.relationship('StudentHistory', backref='student', lazy=True,
                                    cascade="all, delete-orphan",
                                    order_by="desc(StudentHistory.id)")
+    mensalidades = db.relationship('Mensalidade', backref='student', lazy=True,
+                                   cascade="all, delete-orphan",
+                                   order_by="Mensalidade.vencimento")
 
     def to_dict(self):
         classes_str = ", ".join([f"{c.day[:3]} {c.time}" for c in self.classes])
         today = datetime.now().date()
+        today_iso = today.strftime('%Y-%m-%d')
         payment_alert = False
         payment_overdue = False
         plan_expiring = False
 
-        if self.next_payment:
-            try:
-                np_date = datetime.strptime(self.next_payment, '%Y-%m-%d').date()
-                delta = (np_date - today).days
-                if delta < 0:
+        mens = list(self.mensalidades)
+        parcelas_pagas = sum(1 for m in mens if m.pago_em)
+        parcelas_total = len(mens)
+
+        if mens:
+            # Modelo NOVO: status vem das parcelas. Vencido = existe parcela
+            # vencida e não paga. Próx. vencimento = 1ª parcela em aberto.
+            abertas = [m for m in mens if not m.pago_em]
+            for m in abertas:
+                if m.vencimento < today_iso:
                     payment_overdue = True
-                elif delta <= 7:
-                    payment_alert = True
-            except:
-                pass
+                    break
+            prox = min(abertas, key=lambda m: m.vencimento) if abertas else None
+            next_payment_val = prox.vencimento if prox else (mens[-1].vencimento if mens else self.next_payment)
+            if prox and not payment_overdue:
+                try:
+                    delta = (datetime.strptime(prox.vencimento, '%Y-%m-%d').date() - today).days
+                    if 0 <= delta <= 7:
+                        payment_alert = True
+                except:
+                    pass
+        else:
+            # Fallback (aluno sem parcelas geradas): lógica antiga por next_payment.
+            next_payment_val = self.next_payment
+            if self.next_payment:
+                try:
+                    delta = (datetime.strptime(self.next_payment, '%Y-%m-%d').date() - today).days
+                    if delta < 0:
+                        payment_overdue = True
+                    elif delta <= 7:
+                        payment_alert = True
+                except:
+                    pass
 
         if self.end_date:
             try:
@@ -216,7 +299,7 @@ class Student(db.Model):
             'startDate': self.start_date,
             'endDate': self.end_date,
             'paymentDay': self.payment_day,
-            'nextPayment': self.next_payment,
+            'nextPayment': next_payment_val,
             'lastPayment': self.last_payment,
             'classesPerWeek': self.classes_per_week,
             'credits': self.credits,
@@ -232,7 +315,56 @@ class Student(db.Model):
             'payment_alert': payment_alert,
             'payment_overdue': payment_overdue,
             'plan_expiring': plan_expiring,
+            'mensalidades': [m.to_dict(today_iso) for m in mens],
+            'parcelasPagas': parcelas_pagas,
+            'parcelasTotal': parcelas_total,
         }
+
+# ── Carimbo de sync ───────────────────────────────────────────────────────────
+# Seta sync_uid (uma vez) + updated_at (sempre) em todo insert/update dos modelos
+# sincronizáveis. NÃO mexe em PK. É a base pro sync PC↔nuvem (ver PLANO_ACESSO_REMOTO.md).
+import contextlib
+_SYNC_MODELS = (User, Student, ClassSession, Replacement, StudentHistory, Mensalidade, ActivityLog)
+_SYNC_APPLYING = {'on': False}
+
+def _stamp_sync(mapper, connection, target):
+    if _SYNC_APPLYING['on']:
+        return  # aplicando sync: preserva sync_uid/updated_at vindos do peer
+    if not getattr(target, 'sync_uid', None):
+        target.sync_uid = str(uuid.uuid4())
+    target.updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+
+@contextlib.contextmanager
+def applying():
+    _SYNC_APPLYING['on'] = True
+    try:
+        yield
+    finally:
+        _SYNC_APPLYING['on'] = False
+
+for _m in _SYNC_MODELS:
+    event.listen(_m, 'before_insert', _stamp_sync)
+    event.listen(_m, 'before_update', _stamp_sync)
+
+# Especificação das tabelas pro motor de sync (mesma ordem/nomes do arena-sync).
+import sync_core
+SPECS = [
+    sync_core.TableSpec('users', User, ['username', 'password_hash', 'role', 'perms', 'photo'],
+                        natural_key='username'),
+    sync_core.TableSpec('class_session', ClassSession, ['day', 'time', 'professor', 'capacity']),
+    sync_core.TableSpec('student', Student, ['name', 'plan', 'start_date', 'end_date', 'payment_day',
+                                             'next_payment', 'last_payment', 'classes_per_week',
+                                             'credits', 'price', 'active'],
+                        m2m={'class_uids': ('classes', 'class_session')}),
+    sync_core.TableSpec('replacement', Replacement, ['created_at', 'expires_at'], {'student_id': 'student'}),
+    sync_core.TableSpec('student_history', StudentHistory, ['description', 'date_str', 'action_type',
+                                                            'credit_delta'], {'student_id': 'student'}),
+    sync_core.TableSpec('mensalidade', Mensalidade, ['ciclo', 'numero', 'mes_ref', 'vencimento',
+                                                     'valor', 'pago_em'], {'student_id': 'student'}),
+    sync_core.TableSpec('activity_log', ActivityLog, ['system', 'category', 'action_type',
+                                                      'description', 'user', 'date_str', 'created_at']),
+]
+
 
 @login_manager.user_loader
 def load_user(uid):
@@ -261,19 +393,156 @@ def add_activity(description, category='info', action_type='info', system='aulas
 app.add_activity = add_activity
 
 def compute_next_payment(payment_day: int, reference_date: datetime = None) -> str:
+    """Calcula o próximo vencimento a partir de reference_date (a data do pagamento).
+
+    Avança de mês em mês até cair numa data que já passou TANTO da data do
+    pagamento QUANTO de hoje. Isso garante que registrar um pagamento sempre
+    tira o aluno de 'vencido' — antes, avançava só 1 mês e, se a data informada
+    fosse retroativa (ou o dia de vencimento fosse cedo no mês), o próximo
+    vencimento caía antes de hoje e o aluno continuava aparecendo como vencido.
+    """
     if reference_date is None:
         reference_date = datetime.now()
-    day = min(payment_day, 28)
+    try:
+        pd = int(payment_day)
+    except (TypeError, ValueError):
+        pd = 30
+    day = min(max(pd, 1), 28)  # dia fixo, capado em 28 pra nunca estourar em mês curto
+    ref_d = reference_date.date()
+    today = datetime.now().date()
     try:
         candidate = reference_date.replace(day=day)
     except ValueError:
         candidate = reference_date.replace(day=28)
-    if candidate.date() <= reference_date.date():
+    # trava de segurança: nunca laçar infinito (o servidor é single-thread e
+    # um loop preso derrubaria o app inteiro). 120 iterações = 10 anos, folga de sobra.
+    for _ in range(120):
+        cand_d = candidate.date()
+        if cand_d > ref_d and cand_d > today:
+            break
         if candidate.month == 12:
             candidate = candidate.replace(year=candidate.year + 1, month=1)
         else:
             candidate = candidate.replace(month=candidate.month + 1)
     return candidate.strftime('%Y-%m-%d')
+
+
+def parse_brl_money(value, default=0.0) -> float:
+    """Lê um valor em reais tolerante ao que o usuário digita ou ao que o front manda:
+    'R$ 1.200,50', '1.200,50', '150,90', '150.90', '150', 150.9, '', None → float.
+    Nunca levanta exceção — em caso de dúvida devolve `default`. Isso evita que um
+    campo mal digitado derrube o backend (que é single-thread) no meio de um commit."""
+    if value is None:
+        return float(default)
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = re.sub(r'[^\d,.\-]', '', str(value).strip())  # tira 'R$', espaços, letras
+    if not s or s in ('-', '.', ','):
+        return float(default)
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')  # BR: ponto = milhar, vírgula = decimal
+    elif ',' in s:
+        s = s.replace(',', '.')                    # só vírgula = decimal
+    elif '.' in s:
+        # só ponto: pode ser decimal ('150.90') ou milhar BR ('1.200', '1.234.567').
+        # Se TODO grupo após um ponto tiver exatamente 3 dígitos, é separador de milhar.
+        parts = s.split('.')
+        if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+            s = s.replace('.', '')
+    try:
+        return float(s)
+    except ValueError:
+        return float(default)
+
+
+def _parse_date_flex(value):
+    """Aceita 'YYYY-MM-DD', 'DD/MM/YYYY' ou 'DD-MM-YYYY'. Devolve None se vazio/inválido."""
+    if not value:
+        return None
+    value = str(value).strip()
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+# ── PARCELAS / MENSALIDADES ───────────────────────────────────────────────────
+
+PLANO_MESES = {'Mensal': 1, 'Trimestral': 3, 'Semestral': 6, 'Anual': 12}
+
+def plan_months(plan) -> int:
+    """Quantos meses (parcelas) um plano tem. Aceita nome ('Semestral') ou já
+    um número ('6 meses' / 6). Default 1 (nunca 0, pra não gerar plano vazio)."""
+    if isinstance(plan, (int, float)):
+        return max(int(plan), 1)
+    if plan in PLANO_MESES:
+        return PLANO_MESES[plan]
+    m = re.search(r'\d+', str(plan or ''))
+    return max(int(m.group()), 1) if m else 1
+
+def plano_por_meses(n) -> str:
+    """Nome do plano a partir do nº de meses (pra renovação com duração custom)."""
+    for nome, meses in PLANO_MESES.items():
+        if meses == n:
+            return nome
+    return f"{n} meses"
+
+def _last_day_of_month(year, month) -> int:
+    return calendar.monthrange(year, month)[1]
+
+def _dia_venc(year, month, dia) -> str:
+    """Vencimento no dia fixo, respeitando meses curtos (dia 30 em fev → 28/29)."""
+    d = min(max(int(dia), 1), _last_day_of_month(year, month))
+    return f"{year:04d}-{month:02d}-{d:02d}"
+
+def _competencias(start_dt, dia, meses):
+    """Lista de (mes_ref 'YYYY-MM', vencimento 'YYYY-MM-DD') a partir do MÊS DE
+    INÍCIO. A 1ª parcela é SEMPRE no mês em que o aluno começou (quem começou em
+    fevereiro tem a 1ª parcela em fevereiro). O vencimento é o dia fixo do mês,
+    mas a 1ª nunca vence antes da data de início — pra não nascer já vencida antes
+    de o aluno começar. Se não foi paga, aparece pendente/vencida normalmente
+    (o plano só fica 'quitado' quando o operador registra todos os meses)."""
+    y, m = start_dt.year, start_dt.month
+    start_iso = start_dt.strftime('%Y-%m-%d')
+    out = []
+    for i in range(meses):
+        yy = y + (m - 1 + i) // 12
+        mm = (m - 1 + i) % 12 + 1
+        venc = _dia_venc(yy, mm, dia)
+        if i == 0 and venc < start_iso:
+            venc = start_iso
+        out.append((f"{yy:04d}-{mm:02d}", venc))
+    return out
+
+def gerar_mensalidades(student, meses, valor, dia, ciclo, start_dt,
+                       primeira_paga=False, primeira_pago_em=None):
+    """Cria as parcelas de um ciclo do plano. Faz append na relação (não seta
+    student_id na mão) pra que student.mensalidades fique em dia na memória mesmo
+    quando a coleção já tinha sido carregada — senão end_date/next_payment não
+    enxergam as parcelas recém-criadas numa renovação."""
+    comps = _competencias(start_dt, dia, meses)
+    criadas = []
+    for i, (mes_ref, venc) in enumerate(comps, start=1):
+        pago = None
+        if i == 1 and primeira_paga:
+            pago = primeira_pago_em or datetime.now().strftime('%Y-%m-%d')
+        mm = Mensalidade(ciclo=ciclo, numero=i, mes_ref=mes_ref, vencimento=venc,
+                         valor=float(valor or 0.0), pago_em=pago)
+        student.mensalidades.append(mm)
+        criadas.append(mm)
+    return criadas
+
+def sync_pagamento_cache(student):
+    """Mantém next_payment/last_payment do aluno em dia com as parcelas — assim o
+    dashboard e qualquer leitor antigo continuam funcionando sem alteração."""
+    mens = list(student.mensalidades)
+    if not mens:
+        return
+    abertas = sorted([m for m in mens if not m.pago_em], key=lambda m: m.vencimento)
+    pagas = sorted([m for m in mens if m.pago_em], key=lambda m: m.pago_em)
+    student.next_payment = abertas[0].vencimento if abertas else mens[-1].vencimento
+    student.last_payment = pagas[-1].pago_em if pagas else (student.last_payment or '')
 
 # ── IDENTIDADE GLOBAL (Configurações) ─────────────────────────────────────────
 
@@ -844,6 +1113,23 @@ def index():
     return render_template('index.html', user=current_user)
 
 
+@app.route('/manifest.json')
+def manifest():
+    """PWA manifest — atalho na tela inicial do celular com a logo da arena."""
+    ident = get_identity()
+    nome = (ident.get('arena_name') if isinstance(ident, dict) else getattr(ident, 'arena_name', None)) or 'Arena AMP'
+    accent = (ident.get('accent') if isinstance(ident, dict) else getattr(ident, 'accent', None)) or '#FF7A1A'
+    logo = url_for('static', filename='logo.png')
+    return jsonify({
+        'name': nome, 'short_name': nome[:12], 'start_url': '/aulas',
+        'display': 'standalone', 'background_color': '#132539', 'theme_color': '#132539',
+        'icons': [
+            {'src': logo, 'sizes': '192x192', 'type': 'image/png', 'purpose': 'any'},
+            {'src': logo, 'sizes': '512x512', 'type': 'image/png', 'purpose': 'any'},
+        ],
+    })
+
+
 @app.route('/configuracoes')
 @login_required
 def configuracoes():
@@ -882,6 +1168,218 @@ def config_identity():
     db.session.commit()
     add_activity('Identidade da arena atualizada', category='config', action_type='config')
     return jsonify({'ok': True, **get_identity()})
+
+def _local_ips():
+    """IPs IPv4 da máquina (pra montar o link de acesso pelo celular). Inclui o
+    IP da rede local e, se o Tailscale estiver instalado, também o 100.x dele."""
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            ip = info[4][0]
+            if ':' not in ip and not ip.startswith('127.'):
+                ips.add(ip)
+    except Exception:
+        pass
+    try:  # descobre o IP principal da LAN mesmo sem DNS do hostname
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    # Tailscale (100.64.0.0/10) primeiro — é o link recomendado
+    return sorted(ips, key=lambda ip: (not ip.startswith('100.'), ip))
+
+@app.route('/api/config/remote', methods=['GET', 'POST'])
+@login_required
+def config_remote():
+    """Liga/desliga o acesso pelo celular (bind na rede) e mostra o link.
+    Opt-in: vem DESLIGADO. Ligar só passa a valer ao reabrir o app."""
+    guard = _deny_if_not_adm()
+    if guard: return guard
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or request.form
+        val = body.get('enabled')
+        enabled = val in (True, 1, '1', 'true', 'True', 'on')
+        set_setting('remote_access', '1' if enabled else '')
+        db.session.commit()
+        add_activity('Acesso remoto (celular) ' + ('ligado' if enabled else 'desligado'),
+                     category='config', action_type='config')
+        return jsonify({'ok': True, 'enabled': enabled})
+    enabled = get_setting('remote_access', '') == '1'
+    port = request.host.split(':')[-1] if ':' in request.host else '80'
+    ips = _local_ips()
+    return jsonify({
+        'enabled': enabled,
+        'port': port,
+        'ips': ips,
+        'urls': [f'http://{ip}:{port}' for ip in ips],
+    })
+
+# ── CLIENTE DE SYNC COM A NUVEM (arena-sync) ──────────────────────────────────
+# O app do PC empurra/puxa o módulo Aulas do serviço arena-sync (fallback com o
+# PC desligado). Usa o motor compartilhado sync_core. Ver PLANO_ACESSO_REMOTO.md.
+
+# URL do serviço arena-sync (nuvem). Default de produção — o cliente pode
+# sobrescrever por setting `arena_sync_url` ou env ARENA_SYNC_URL (ex.: teste).
+ARENA_SYNC_URL_DEFAULT = 'https://arena-sync-rh5a.onrender.com'
+
+def _sync_cfg():
+    base = (get_setting('arena_sync_url', '') or os.environ.get('ARENA_SYNC_URL', '')
+            or ARENA_SYNC_URL_DEFAULT).rstrip('/')
+    return base, get_setting('arena_token', ''), get_setting('sync_secret', '')
+
+def _sync_post(url, body, secret=None, timeout=90):
+    import json as _json
+    from urllib import request as _rq
+    headers = {'Content-Type': 'application/json'}
+    if secret:
+        headers['X-Sync-Secret'] = secret
+    req = _rq.Request(url, data=_json.dumps(body).encode('utf-8'), method='POST', headers=headers)
+    with _rq.urlopen(req, timeout=timeout) as r:
+        return _json.loads(r.read().decode('utf-8'))
+
+def sync_provision():
+    """Registra a arena no arena-sync (uma vez). Manda a chave + o payload de
+    licença JÁ ASSINADO (do cache) pro arena-sync verificar a assinatura, em vez
+    de revalidar (que exigiria ser a máquina vinculada). Guarda token + segredo."""
+    import license_client
+    base, _, _ = _sync_cfg()
+    if not base:
+        raise RuntimeError('URL do arena-sync não configurada')
+    lic = license_client.cached_license()
+    if not lic.get('license_key'):
+        raise RuntimeError('sem chave de licença')
+    r = _sync_post(base + '/provision', {
+        'license_key': lic['license_key'],
+        'payload': lic.get('payload'),
+        'signature': lic.get('signature'),
+    })
+    set_setting('arena_token', r['arena_token'])
+    set_setting('sync_secret', r['sync_secret'])
+    db.session.commit()
+    return r
+
+def sync_pull():
+    """Puxa o estado do servidor e funde localmente (adota o que a funcionária
+    fez com o PC desligado)."""
+    base, token, secret = _sync_cfg()
+    data = _sync_post(f'{base}/a/{token}/sync/pull', {}, secret)
+    return sync_core.apply_state(db.session, SPECS, data, applying)
+
+def sync_push():
+    """Empurra o estado local pro servidor (o servidor funde, mais-recente-vence)."""
+    base, token, secret = _sync_cfg()
+    payload = sync_core.export_state(db.session, SPECS)
+    return _sync_post(f'{base}/a/{token}/sync/push', payload, secret)
+
+def sync_now():
+    """Sincroniza nos dois sentidos: puxa primeiro (adota mudanças da nuvem),
+    depois empurra. Devolve o resumo (pra 'Fulana fez X mudanças'). Se a arena não
+    existir mais no servidor (recriado/limpo → 403), re-provisiona e tenta 1x."""
+    if not get_setting('arena_token', ''):
+        sync_provision()
+    try:
+        resumo = sync_pull()
+        sync_push()
+    except Exception:
+        sync_provision()          # arena sumiu do servidor? recria + novo segredo
+        resumo = sync_pull()
+        sync_push()
+    set_setting('sync_last', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    db.session.commit()
+    return resumo
+
+# Sync EM SEGUNDO PLANO: nunca trava a tela (o Render pode demorar ~40s no cold
+# start). A UI dispara e depois consulta o status por /api/sync/auto.
+_sync_lock = threading.Lock()
+
+def _run_sync_bg():
+    def job():
+        with app.app_context():
+            if not _sync_lock.acquire(blocking=False):
+                return   # já tem uma sincronização rodando
+            try:
+                set_setting('sync_status', 'running'); set_setting('sync_msg', '')
+                db.session.commit()
+                resumo = sync_now()
+                vindos = sum((t.get('novos', 0) + t.get('atualizados', 0)) for t in resumo.values())
+                set_setting('sync_status', 'ok')
+                set_setting('sync_msg', (f'{vindos} mudança(s) recebida(s) da nuvem.'
+                                         if vindos else 'Tudo em dia.'))
+                db.session.commit()
+            except Exception as e:
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                set_setting('sync_status', 'error')
+                set_setting('sync_msg', f'Falhou: {e}'[:200])
+                try:
+                    db.session.commit()
+                except Exception:
+                    pass
+                app.logger.warning('sync em background falhou', exc_info=True)
+            finally:
+                _sync_lock.release()
+    threading.Thread(target=job, daemon=True).start()
+
+@app.route('/api/sync/now', methods=['POST'])
+@login_required
+def api_sync_now():
+    guard = _deny_if_not_adm()
+    if guard: return guard
+    _run_sync_bg()      # dispara e volta na hora (não trava a tela)
+    return jsonify({'ok': True, 'started': True})
+
+def sync_auto(kind='both'):
+    """Sync best-effort do auto-sync (run_desktop). Só age com o opt-in `cloud_sync`
+    ligado E a URL configurada. NUNCA levanta exceção — não pode quebrar a abertura
+    nem o fechamento do app."""
+    try:
+        if get_setting('cloud_sync', '') != '1':
+            return
+        base, token, secret = _sync_cfg()
+        if not base:
+            return
+        if not token:
+            sync_provision()
+        if kind in ('pull', 'both'):
+            sync_pull()
+        if kind in ('push', 'both'):
+            sync_push()
+        set_setting('sync_last', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        db.session.commit()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        app.logger.warning('auto-sync (best-effort) falhou', exc_info=True)
+
+def _arena_link():
+    """Link pronto pra dar pra funcionária (com o token embutido). Só existe
+    depois de provisionar (arena_token setado)."""
+    base, token, _ = _sync_cfg()   # base já cai no default de produção
+    return f"{base}/a/{token}/" if (base and token) else ''
+
+@app.route('/api/sync/auto', methods=['GET', 'POST'])
+@login_required
+def api_sync_auto():
+    guard = _deny_if_not_adm()
+    if guard: return guard
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or request.form
+        enabled = body.get('enabled') in (True, 1, '1', 'true', 'True', 'on')
+        set_setting('cloud_sync', '1' if enabled else '')
+        db.session.commit()
+        if enabled:
+            _run_sync_bg()   # provisiona + 1ª sincronização em segundo plano
+        return jsonify({'ok': True, 'enabled': enabled})
+    return jsonify({'enabled': get_setting('cloud_sync', '') == '1',
+                    'last': get_setting('sync_last', ''), 'link': _arena_link(),
+                    'status': get_setting('sync_status', ''),
+                    'msg': get_setting('sync_msg', '')})
 
 @app.route('/api/config/users', methods=['GET', 'POST'])
 @login_required
@@ -985,6 +1483,7 @@ def add_student_to_class(class_id):
     s = db.session.get(Student, int(request.json.get('student_id')))
     if c and s and s not in c.students:
         c.students.append(s)
+        s.updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')  # bump p/ sincronizar a matrícula
         add_activity(f"{s.name} matriculado na turma {c.day} {c.time}",
                      category='matricula', action_type='matricula')
         db.session.commit()
@@ -997,6 +1496,7 @@ def remove_student_from_class(class_id):
     s = db.session.get(Student, int(request.json.get('student_id')))
     if c and s and s in c.students:
         c.students.remove(s)
+        s.updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')  # bump p/ sincronizar a matrícula
         add_activity(f"{s.name} removido da turma {c.day} {c.time}",
                      category='turma', action_type='desmatricula')
         db.session.commit()
@@ -1010,43 +1510,66 @@ def manage_students():
     if request.method == 'GET':
         return jsonify([s.to_dict() for s in Student.query.all()])
 
-    d = request.json
-    payment_day = int(d.get('paymentDay', 30))
-    start_str = d['startDate']
-    start_dt = datetime.strptime(start_str, '%Y-%m-%d')
-    next_pay = compute_next_payment(payment_day, start_dt)
+    try:
+        d = request.json or {}
+        payment_day = int(d.get('paymentDay', 30) or 30)
+        start_dt = _parse_date_flex(d.get('startDate')) or datetime.now()
+        start_str = start_dt.strftime('%Y-%m-%d')
+        plan = d.get('plan', 'Mensal')
+        meses = plan_months(plan)
+        price = parse_brl_money(d.get('price'), 0.0)
+        # Fim do plano = start + nº de meses (fonte da verdade, sem digitar errado)
+        end_dt = _parse_date_flex(d.get('endDate'))
+        if not end_dt:
+            comps = _competencias(start_dt, payment_day, meses)
+            end_dt = datetime.strptime(comps[-1][1], '%Y-%m-%d') if comps else start_dt
+        end_str = end_dt.strftime('%Y-%m-%d')
 
-    new_s = Student(
-        name=d['name'],
-        plan=d['plan'],
-        price=float(str(d['price']).replace(',', '.')),
-        start_date=start_str,
-        end_date=d['endDate'],
-        payment_day=payment_day,
-        next_payment=d.get('nextPayment') or next_pay,
-        last_payment=d.get('lastPayment', ''),
-        classes_per_week=int(d.get('classesPerWeek', 2)),
-        credits=int(d.get('saldoAulas', 0))
-    )
+        new_s = Student(
+            name=d.get('name', 'Sem nome'),
+            plan=plan,
+            price=price,
+            start_date=start_str,
+            end_date=end_str,
+            payment_day=payment_day,
+            next_payment=start_str,   # ajustado pelo sync logo abaixo
+            last_payment=d.get('lastPayment', '') or '',
+            classes_per_week=int(d.get('classesPerWeek', 2) or 2),
+            credits=int(d.get('saldoAulas', 0) or 0)
+        )
 
-    if 'classIds' in d:
-        for cid in d['classIds']:
-            try:
-                c = db.session.get(ClassSession, int(cid))
-                if c:
-                    new_s.classes.append(c)
-            except:
-                continue
+        if 'classIds' in d:
+            for cid in d['classIds']:
+                try:
+                    c = db.session.get(ClassSession, int(cid))
+                    if c:
+                        new_s.classes.append(c)
+                except:
+                    continue
 
-    db.session.add(new_s)
-    db.session.flush()
-    add_history(new_s.id,
-                f"Plano {new_s.plan} iniciado. Início: {new_s.start_date} | Fim: {new_s.end_date} | Venc. todo dia {new_s.payment_day}",
-                action_type='info')
-    add_activity(f"Aluno {new_s.name} cadastrado — plano {new_s.plan}",
-                 category='aluno', action_type='aluno_criado')
-    db.session.commit()
-    return jsonify(new_s.to_dict())
+        db.session.add(new_s)
+        db.session.flush()
+
+        # Gera as parcelas do plano (1º ciclo). Opção de já marcar a 1ª como paga
+        # (comum na matrícula) — usa a data informada em lastPayment se houver.
+        primeira_paga = bool(d.get('firstPaid'))
+        gerar_mensalidades(new_s, meses, price, payment_day, ciclo=1, start_dt=start_dt,
+                            primeira_paga=primeira_paga,
+                            primeira_pago_em=(d.get('lastPayment') or start_str))
+        db.session.flush()
+        sync_pagamento_cache(new_s)
+
+        add_history(new_s.id,
+                    f"Plano {new_s.plan} iniciado ({meses}x). Início: {new_s.start_date} | Fim: {new_s.end_date} | Venc. todo dia {new_s.payment_day}",
+                    action_type='info')
+        add_activity(f"Aluno {new_s.name} cadastrado — plano {new_s.plan}",
+                     category='aluno', action_type='aluno_criado')
+        db.session.commit()
+        return jsonify(new_s.to_dict())
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception('criar aluno falhou')
+        return jsonify({'error': f'Não foi possível cadastrar o aluno: {e}'}), 400
 
 @app.route('/api/students/<int:id>/update', methods=['PUT'])
 @login_required
@@ -1055,36 +1578,71 @@ def update_student_data(id):
     if not s:
         return jsonify({'error': 'Not found'}), 404
 
-    d = request.json
-    s.name = d['name']
-    s.plan = d['plan']
-    s.price = float(str(d['price']).replace(',', '.'))
-    s.start_date = d['startDate']
-    s.end_date = d['endDate']
-    s.payment_day = int(d.get('paymentDay', s.payment_day))
-    s.next_payment = d['nextPayment']
-    s.last_payment = d.get('lastPayment', '')
-    s.classes_per_week = int(d.get('classesPerWeek', 2))
+    try:
+        d = request.json or {}
+        antigo = (s.plan, s.start_date, s.payment_day, s.price)
 
-    new_credits = int(d.get('saldoAulas', s.credits))
-    if s.credits != new_credits:
-        add_history(s.id, f"Saldo ajustado manualmente: {s.credits} → {new_credits}",
-                    action_type='info', credit_delta=new_credits - s.credits)
-    s.credits = new_credits
+        s.name = d.get('name', s.name)
+        s.plan = d.get('plan', s.plan)
+        s.price = parse_brl_money(d.get('price'), s.price)
+        start_dt = _parse_date_flex(d.get('startDate'))
+        if start_dt:
+            s.start_date = start_dt.strftime('%Y-%m-%d')
+        s.payment_day = int(d.get('paymentDay', s.payment_day) or s.payment_day)
+        s.classes_per_week = int(d.get('classesPerWeek', 2) or 2)
 
-    s.classes = []
-    if 'classIds' in d:
-        for cid in d['classIds']:
-            try:
-                c = db.session.get(ClassSession, int(cid))
-                if c:
-                    s.classes.append(c)
-            except:
-                continue
+        # Fim = start + meses do plano (mantém a regra do cadastro).
+        meses = plan_months(s.plan)
+        end_dt = _parse_date_flex(d.get('endDate'))
+        if not end_dt and start_dt:
+            comps = _competencias(start_dt, s.payment_day, meses)
+            end_dt = datetime.strptime(comps[-1][1], '%Y-%m-%d') if comps else start_dt
+        if end_dt:
+            s.end_date = end_dt.strftime('%Y-%m-%d')
+        elif d.get('endDate'):
+            s.end_date = d['endDate']
 
-    add_activity(f"Aluno {s.name} editado", category='aluno', action_type='aluno_editado')
-    db.session.commit()
-    return jsonify(s.to_dict())
+        new_credits = int(d.get('saldoAulas', s.credits) or 0)
+        if s.credits != new_credits:
+            add_history(s.id, f"Saldo ajustado manualmente: {s.credits} → {new_credits}",
+                        action_type='info', credit_delta=new_credits - s.credits)
+        s.credits = new_credits
+
+        s.classes = []
+        if 'classIds' in d:
+            for cid in d['classIds']:
+                try:
+                    c = db.session.get(ClassSession, int(cid))
+                    if c:
+                        s.classes.append(c)
+                except:
+                    continue
+
+        # Se o que define as parcelas mudou E nenhuma parcela foi paga ainda,
+        # regenera o 1º ciclo (corrige um cadastro feito errado). Se já tem
+        # pagamento, NÃO mexe — preserva o histórico; use "Renovar" pra estender.
+        mudou_plano = (s.plan, s.start_date, s.payment_day, s.price) != antigo
+        alguma_paga = any(m.pago_em for m in s.mensalidades)
+        if mudou_plano and not alguma_paga and start_dt:
+            for m in list(s.mensalidades):
+                db.session.delete(m)
+            db.session.flush()
+            gerar_mensalidades(s, meses, s.price, s.payment_day, ciclo=1, start_dt=start_dt)
+            db.session.flush()
+        # mantém valor das parcelas em aberto alinhado ao preço, se mudou o preço
+        elif s.price != antigo[3]:
+            for m in s.mensalidades:
+                if not m.pago_em:
+                    m.valor = s.price
+        sync_pagamento_cache(s)
+
+        add_activity(f"Aluno {s.name} editado", category='aluno', action_type='aluno_editado')
+        db.session.commit()
+        return jsonify(s.to_dict())
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception('editar aluno falhou')
+        return jsonify({'error': f'Não foi possível salvar as alterações: {e}'}), 400
 
 @app.route('/api/students/<int:id>/delete', methods=['DELETE'])
 @login_required
@@ -1189,24 +1747,133 @@ def delete_history_entry(student_id, history_id):
 def register_payment(id):
     s = db.session.get(Student, id)
     if not s:
-        return jsonify({'error': 'Not found'}), 404
+        return jsonify({'error': 'Aluno não encontrado'}), 404
 
-    d = request.json
-    payment_date_str = d.get('paymentDate', datetime.now().strftime('%Y-%m-%d'))
-    amount = float(str(d.get('amount', s.price)).replace(',', '.'))
+    try:
+        d = request.json or {}
+        payment_dt = _parse_date_flex(d.get('paymentDate')) or datetime.now()
+        payment_date_str = payment_dt.strftime('%Y-%m-%d')
 
-    s.last_payment = payment_date_str
-    payment_dt = datetime.strptime(payment_date_str, '%Y-%m-%d')
-    s.next_payment = compute_next_payment(s.payment_day, payment_dt)
+        # Escolhe a parcela: a informada (mensalidadeId) ou, na falta, a mais
+        # antiga em aberto (vencida primeiro). Assim o botão "Registrar" simples
+        # continua funcionando mesmo sem escolher o mês.
+        mid = d.get('mensalidadeId')
+        alvo = None
+        if mid:
+            alvo = db.session.get(Mensalidade, int(mid))
+            if not alvo or alvo.student_id != s.id:
+                return jsonify({'error': 'Parcela não encontrada'}), 404
+        else:
+            abertas = sorted([m for m in s.mensalidades if not m.pago_em],
+                             key=lambda m: m.vencimento)
+            alvo = abertas[0] if abertas else None
 
-    fmt = f"{amount:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
-    add_history(s.id,
-                f"💰 Pagamento recebido: R$ {fmt} em {payment_dt.strftime('%d/%m/%Y')} — Próx. venc.: dia {s.payment_day}",
-                action_type='pagamento', credit_delta=0)
-    add_activity(f"{s.name} — R$ {fmt} recebido", category='pagamento', action_type='pagamento')
+        amount = parse_brl_money(d.get('amount'), default=(alvo.valor if alvo else s.price) or 0.0)
+        fmt = f"{amount:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
-    db.session.commit()
-    return jsonify({'success': True, 'student': s.to_dict()})
+        if alvo:
+            if alvo.pago_em:
+                return jsonify({'error': 'Essa parcela já está paga'}), 400
+            alvo.pago_em = payment_date_str
+            if amount:
+                alvo.valor = amount
+            comp = f"{alvo.mes_ref[5:7]}/{alvo.mes_ref[0:4]}"
+            desc = f"💰 Pagamento recebido: R$ {fmt} (parcela {comp}) em {payment_dt.strftime('%d/%m/%Y')}"
+        else:
+            # aluno sem parcelas (fallback do modelo antigo)
+            s.last_payment = payment_date_str
+            s.next_payment = compute_next_payment(s.payment_day, payment_dt)
+            desc = f"💰 Pagamento recebido: R$ {fmt} em {payment_dt.strftime('%d/%m/%Y')}"
+
+        db.session.flush()
+        sync_pagamento_cache(s)
+        add_history(s.id, desc, action_type='pagamento', credit_delta=0)
+        add_activity(f"{s.name} — R$ {fmt} recebido", category='pagamento', action_type='pagamento')
+
+        db.session.commit()
+        return jsonify({'success': True, 'student': s.to_dict()})
+    except Exception as e:
+        # nunca deixa a sessão poluída derrubar o app (single-thread): faz rollback
+        # e devolve erro tratado, em vez de estourar 500 e travar tudo até reiniciar.
+        db.session.rollback()
+        app.logger.exception('register_payment falhou')
+        return jsonify({'error': f'Não foi possível registrar o pagamento: {e}'}), 400
+
+@app.route('/api/students/<int:id>/mensalidades/<int:mid>/estornar', methods=['POST'])
+@login_required
+def estornar_mensalidade(id, mid):
+    """Desfaz o pagamento de uma parcela (marca de volta como em aberto)."""
+    s = db.session.get(Student, id)
+    m = db.session.get(Mensalidade, mid)
+    if not s or not m or m.student_id != s.id:
+        return jsonify({'error': 'Parcela não encontrada'}), 404
+    try:
+        if not m.pago_em:
+            return jsonify({'error': 'Essa parcela não está paga'}), 400
+        comp = f"{m.mes_ref[5:7]}/{m.mes_ref[0:4]}"
+        m.pago_em = None
+        db.session.flush()
+        sync_pagamento_cache(s)
+        add_history(s.id, f"↩️ Pagamento estornado (parcela {comp})",
+                    action_type='estorno', credit_delta=0)
+        add_activity(f"{s.name} — pagamento estornado (parcela {comp})",
+                     category='pagamento', action_type='estorno')
+        db.session.commit()
+        return jsonify({'success': True, 'student': s.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception('estornar falhou')
+        return jsonify({'error': f'Não foi possível estornar: {e}'}), 400
+
+@app.route('/api/students/<int:id>/renovar', methods=['POST'])
+@login_required
+def renovar_plano(id):
+    """Gera um novo ciclo de parcelas (renovação), pela duração escolhida,
+    continuando a partir do fim do plano atual. Não recadastra o aluno."""
+    s = db.session.get(Student, id)
+    if not s:
+        return jsonify({'error': 'Aluno não encontrado'}), 404
+    try:
+        d = request.json or {}
+        meses = plan_months(d.get('meses') or d.get('plan') or 6)
+        valor = parse_brl_money(d.get('valor'), default=s.price or 0.0)
+        dia = int(d.get('paymentDay', s.payment_day) or s.payment_day)
+
+        mens = list(s.mensalidades)
+        ciclo = (max((m.ciclo for m in mens), default=0)) + 1
+        # começa no mês seguinte ao último vencimento existente
+        if mens:
+            ultimo = max(m.vencimento for m in mens)
+            base = datetime.strptime(ultimo, '%Y-%m-%d')
+            y, mo = base.year, base.month + 1
+            if mo > 12:
+                mo = 1; y += 1
+            start_dt = datetime(y, mo, 1, 12)
+        else:
+            start_dt = datetime.now()
+
+        gerar_mensalidades(s, meses, valor, dia, ciclo=ciclo, start_dt=start_dt)
+        db.session.flush()
+
+        # atualiza plano/preço/fim conforme a renovação
+        s.plan = plano_por_meses(meses)
+        s.price = valor
+        s.payment_day = dia
+        novas = [m for m in s.mensalidades if m.ciclo == ciclo]
+        if novas:
+            s.end_date = max(m.vencimento for m in novas)
+        sync_pagamento_cache(s)
+
+        add_history(s.id, f"🔄 Plano renovado: +{meses} mês(es) — R$ {valor:.2f}".replace('.', ','),
+                    action_type='renovacao', credit_delta=0)
+        add_activity(f"{s.name} — plano renovado (+{meses} meses)",
+                     category='aluno', action_type='renovacao')
+        db.session.commit()
+        return jsonify({'success': True, 'student': s.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception('renovar falhou')
+        return jsonify({'error': f'Não foi possível renovar: {e}'}), 400
 
 # ── ALERTS ────────────────────────────────────────────────────────────────────
 
@@ -1393,6 +2060,102 @@ def _auto_migrate():
         pass
 
 
+def _backfill_mensalidades():
+    """Gera as parcelas dos alunos que ainda não têm nenhuma (roda no startup, é
+    idempotente). Marca como PAGAS as competências até o último pagamento do aluno
+    (last_payment); o resto fica vencida/a vencer. Aproximação segura — o dono da
+    arena ajusta manualmente qualquer caso na tela."""
+    try:
+        alunos = Student.query.all()
+        criou = False
+        for s in alunos:
+            if s.mensalidades:
+                continue  # já migrado
+            start_dt = _parse_date_flex(s.start_date) or datetime.now()
+            meses = plan_months(s.plan)
+            dia = s.payment_day or 30
+            comps = _competencias(start_dt, dia, meses)
+            # mês do último pagamento (YYYY-MM) — parcelas até aí entram como pagas
+            lp = _parse_date_flex(s.last_payment)
+            lp_mes = lp.strftime('%Y-%m') if lp else None
+            for i, (mes_ref, venc) in enumerate(comps, start=1):
+                pago = venc if (lp_mes and mes_ref <= lp_mes) else None
+                s.mensalidades.append(Mensalidade(
+                    ciclo=1, numero=i, mes_ref=mes_ref,
+                    vencimento=venc, valor=float(s.price or 0.0), pago_em=pago))
+            criou = True
+        if criou:
+            db.session.flush()
+            for s in alunos:
+                sync_pagamento_cache(s)
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception('backfill de mensalidades falhou')
+
+
+def _backfill_fix_parcela_alignment():
+    """Corrige as parcelas geradas pelo modelo antigo (que pulava 1 mês quando o
+    dia de início já tinha passado do dia de vencimento). Agora a 1ª parcela fica
+    SEMPRE no mês de início. Idempotente: só mexe no que está desalinhado, preserva
+    quais foram pagas (as pagas continuam pagas, com o vencimento corrigido). Só
+    trata o caso comum (1 ciclo, nº de parcelas == plano) pra não arriscar renovados.
+    Roda 1x — protegida por flag em Settings."""
+    try:
+        if get_setting('parcelas_realinhadas') == '1':
+            return 0
+        mudou = 0
+        for s in Student.query.all():
+            mens = sorted(s.mensalidades, key=lambda m: (m.ciclo, m.numero))
+            if not mens:
+                continue
+            meses = plan_months(s.plan)
+            if len(set(m.ciclo for m in mens)) != 1 or len(mens) != meses:
+                continue  # renovado / fora do padrão — não mexe
+            start_dt = _parse_date_flex(s.start_date)
+            if not start_dt:
+                continue
+            correct = _competencias(start_dt, s.payment_day or 30, meses)
+            for parc, (mes_ref, venc) in zip(mens, correct):
+                if parc.mes_ref != mes_ref or parc.vencimento != venc:
+                    parc.mes_ref = mes_ref
+                    parc.vencimento = venc
+                    if parc.pago_em:            # backfill sintético: mantém "pago no vencimento"
+                        parc.pago_em = venc
+                    mudou += 1
+            sync_pagamento_cache(s)
+        set_setting('parcelas_realinhadas', '1')
+        db.session.commit()
+        return mudou
+    except Exception:
+        db.session.rollback()
+        app.logger.exception('realinhamento de parcelas falhou')
+        return 0
+
+
+def _backfill_sync_fields():
+    """Preenche sync_uid + updated_at nos registros que ainda não têm (1ª abertura
+    após a atualização de sync). Idempotente e aditivo — não toca em PK nem apaga
+    nada. Ver PLANO_ACESSO_REMOTO.md."""
+    try:
+        agora = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        mexeu = False
+        for Model in _SYNC_MODELS:
+            faltando = Model.query.filter(Model.sync_uid.is_(None)).all()
+            for row in faltando:
+                # atribuição direta (não via evento) pra controlar o backfill;
+                # o before_update ainda carimba updated_at no flush.
+                row.sync_uid = str(uuid.uuid4())
+                if not row.updated_at:
+                    row.updated_at = agora
+                mexeu = True
+        if mexeu:
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception('backfill de sync_uid falhou')
+
+
 @app.route('/migrate')
 @login_required
 def migrate():
@@ -1514,6 +2277,12 @@ def backup():
              'action_type': h.action_type or 'info',
              'credit_delta': h.credit_delta or 0}
             for h in s.history_logs
+        ]
+        # Include parcelas (mensalidades)
+        sd['_mensalidades_raw'] = [
+            {'ciclo': m.ciclo, 'numero': m.numero, 'mes_ref': m.mes_ref,
+             'vencimento': m.vencimento, 'valor': m.valor, 'pago_em': m.pago_em}
+            for m in s.mensalidades
         ]
         students_data.append(sd)
 
@@ -1653,6 +2422,16 @@ def restore():
                     credit_delta=h.get('credit_delta', 0)
                 ))
 
+            # Parcelas (mensalidades) — se o backup for de versão anterior sem
+            # elas, ficam vazias e o _backfill_mensalidades gera no próximo boot.
+            for m in sd.get('_mensalidades_raw', []):
+                db.session.add(Mensalidade(
+                    student_id=ns.id,
+                    ciclo=m.get('ciclo', 1), numero=m.get('numero', 1),
+                    mes_ref=m.get('mes_ref', ''), vencimento=m.get('vencimento', ''),
+                    valor=float(m.get('valor', 0) or 0), pago_em=m.get('pago_em')
+                ))
+
             results.append(f"✅ Aluno '{sd['name']}' restaurado")
 
         # 3. Restore enrollments
@@ -1707,4 +2486,6 @@ if __name__ == '__main__':
     with app.app_context():
         _auto_migrate()
         db.create_all()
+        _backfill_mensalidades()
+        _backfill_sync_fields()
     app.run(host='127.0.0.1', debug=False)

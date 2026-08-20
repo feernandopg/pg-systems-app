@@ -281,6 +281,17 @@ def current_key():
     return _load_local().get('license_key', '')
 
 
+def cached_license():
+    """Devolve a licença assinada guardada localmente (payload + assinatura), pra
+    provar a outros serviços (ex.: arena-sync) que este PC tem licença ativa —
+    sem eles precisarem ser a máquina vinculada. Só repassa o que o servidor
+    de licença já assinou."""
+    l = _load_local()
+    return {'license_key': l.get('license_key', ''),
+            'payload': l.get('payload'),
+            'signature': l.get('signature')}
+
+
 def clear_key():
     """Esquece a licença guardada neste PC (apaga o license.json) pra o app
     voltar a pedir uma chave. Usado no 'Usar outra chave' — resolve o caso de

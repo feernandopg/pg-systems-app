@@ -94,6 +94,30 @@ def _free_port():
     return port
 
 
+def _pick_port(remote):
+    """Com acesso remoto LIGADO, usa uma porta FIXA (5000..5010) pro link do
+    celular ficar estável. Desligado, mantém a porta dinâmica de sempre."""
+    if not remote:
+        return _free_port()
+    for p in range(5000, 5011):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(('0.0.0.0', p))
+            s.close()
+            return p
+        except OSError:
+            s.close()
+            continue
+    return _free_port()
+
+
+def _remote_enabled():
+    """Acesso pela rede local / Tailscale foi REMOVIDO — o acesso pelo celular
+    agora é 100% pela nuvem (arena-sync). O servidor local sempre fica só no
+    127.0.0.1 (mais seguro: nada exposto na rede)."""
+    return False
+
+
 def _ensure_admin():
     with flask_app.app_context():
         # 1º migra colunas que faltam (updates com campo novo), 2º cria tabelas
@@ -104,6 +128,16 @@ def _ensure_admin():
         except Exception:
             pass
         db.create_all()
+        # Gera as parcelas (mensalidades) dos alunos que ainda não têm — roda 1x
+        # na 1ª abertura após a atualização, migrando toda a base do cliente.
+        try:
+            from app import (_backfill_mensalidades, _backfill_sync_fields,
+                             _backfill_fix_parcela_alignment)
+            _backfill_mensalidades()
+            _backfill_fix_parcela_alignment()   # corrige 1ª parcela p/ o mês de início
+            _backfill_sync_fields()
+        except Exception:
+            pass
         admin = User.query.filter_by(username='admin').first()
         if not admin:
             admin = User(username='admin', role='adm', perms='aulas,ranking,comandas')
@@ -125,12 +159,16 @@ def _start_flask_once():
     global _flask_started, _base_url
     if _flask_started:
         return _base_url
-    port = _free_port()
-    _base_url = f'http://127.0.0.1:{port}/'
     _ensure_admin()
+    # Acesso remoto (opt-in): liga o bind na rede + porta fixa; senão, local só.
+    remote = _remote_enabled()
+    host = '0.0.0.0' if remote else '127.0.0.1'
+    port = _pick_port(remote)
+    _base_url = f'http://127.0.0.1:{port}/'   # a janela do dono é sempre local
+    _log(f'flask host={host} port={port} remoto={"on" if remote else "off"}')
 
     def run():
-        flask_app.run(host='127.0.0.1', port=port,
+        flask_app.run(host=host, port=port,
                       threaded=True, use_reloader=False, debug=False)
 
     threading.Thread(target=run, daemon=True).start()
@@ -141,7 +179,34 @@ def _start_flask_once():
         except OSError:
             time.sleep(0.1)
     _flask_started = True
+    _start_auto_sync()
     return _base_url
+
+
+def _start_auto_sync():
+    """Auto-sync com a nuvem (opt-in `cloud_sync`): puxa ao abrir + a cada 5 min,
+    e empurra ao fechar. Tudo best-effort e em background — o `sync_auto` já é
+    no-op se não estiver configurado, então em cliente sem nuvem não faz nada."""
+    def _run(kind):
+        try:
+            with flask_app.app_context():
+                from app import sync_auto
+                sync_auto(kind)
+        except Exception as e:
+            _log('auto-sync ' + kind + ' falhou: ' + repr(e))
+
+    # puxa ao abrir (depois de 8s, em background — não trava a janela; se o Render
+    # estiver dormindo, o cold start de ~40s acontece aqui sem incomodar)
+    threading.Timer(8, lambda: _run('pull')).start()
+
+    def _loop():
+        while True:
+            time.sleep(300)     # a cada 5 min: empurra + puxa
+            _run('both')
+    threading.Thread(target=_loop, daemon=True).start()
+
+    import atexit
+    atexit.register(lambda: _run('push'))   # empurra ao fechar (best-effort)
 
 
 # ── Portaria de licença servida pelo Flask ────────────────────────────────────

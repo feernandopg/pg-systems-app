@@ -218,6 +218,7 @@ body { background-color: var(--paper); color: var(--ink); height: 100vh; overflo
     border-radius: 15px; box-shadow: 0 24px 50px -12px rgba(0,0,0,0.3);
     animation: popIn 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
     max-height: 92vh; overflow-y: auto;
+    -webkit-overflow-scrolling: touch;   /* rolagem com inércia no celular */
 }
 @keyframes popIn { from { transform: scale(0.94); opacity: 0; } to { transform: scale(1); opacity: 1; } }
 .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 15px 22px; border-bottom: 1px solid var(--line); }
@@ -293,6 +294,40 @@ input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px 
 .he-ds { font-size: 0.82rem; color: var(--ink); margin-top: 2px; }
 .he-undo { font-family: var(--disp); font-weight: 700; font-size: 0.68rem; text-transform: uppercase; color: var(--danger); border: 1px solid #F3C8BE; border-radius: 6px; padding: 4px 8px; cursor: pointer; white-space: nowrap; background: none; }
 .he-undo:hover { background: var(--danger-bg); }
+
+/* grid de 3 campos no formulário (colapsa no celular — ver bloco mobile) */
+.fg3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+
+/* ── PARCELAS (mensalidades) ── */
+.am-btn.sel { outline: 2px solid var(--primary); outline-offset: 1px; }
+.am-btn.paga { border-color: #CDE8AC; background: #FBFEF5; } .am-btn.paga .lf { color: var(--lime-deep); } .am-btn.paga .am-pill { background: var(--lime-bg); color: var(--lime-deep); }
+.am-btn.venc { background: #FEF6F2; border-color: #F4D3C4; } .am-btn.venc .lf { color: var(--danger); } .am-btn.venc .am-pill { background: #FBD9CC; color: var(--danger); }
+.am-btn.aberta .lf { color: #51657A; } .am-btn.aberta .am-pill { background: #EDEFF2; color: #5A6B7A; }
+.parc-list { display: flex; flex-direction: column; gap: 8px; max-height: 230px; overflow-y: auto; padding-right: 3px; }
+.parc-estorno { font-family: var(--disp); font-weight: 700; font-size: 0.62rem; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px; cursor: pointer; background: none; }
+.parc-estorno:hover { color: var(--danger); border-color: #F3C8BE; }
+.pay-panel { background: var(--paper); border: 1px solid var(--line); border-radius: 11px; padding: 13px; margin-top: 12px; }
+.pay-panel .sec { font-family: var(--disp); font-weight: 700; font-size: 0.72rem; letter-spacing: .6px; text-transform: uppercase; color: #4E5E6D; margin-bottom: 10px; }
+.pay-panel.renov .sec { color: var(--blue); }
+
+/* Prévia das parcelas no cadastro */
+.parc-preview { border: 1px solid #CDE8AC; background: #F7FCEE; border-radius: 11px; padding: 12px 13px; }
+.parc-preview-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
+.parc-preview-title { font-family: var(--disp); font-weight: 700; font-size: 0.74rem; letter-spacing: .5px; text-transform: uppercase; color: var(--lime-deep); display: flex; align-items: center; gap: 7px; }
+.parc-preview-sum { font-family: var(--disp); font-weight: 700; font-size: 0.72rem; color: #51657A; }
+.parc-preview-list { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.parc-preview-item { display: flex; align-items: center; justify-content: space-between; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+.parc-preview-item .pl { font-family: var(--disp); font-weight: 700; font-size: 0.84rem; color: var(--ink); }
+.parc-preview-item .pr { font-size: 0.7rem; color: var(--muted); }
+.parc-preview-item.paid { border-color: #CDE8AC; background: var(--lime-bg); }
+.parc-preview-item.paid .pr { color: var(--lime-deep); font-weight: 700; }
+
+/* Resumo de parcelas na linha do aluno */
+.st-pay small.parc { color: #40515F; font-weight: 700; font-family: var(--disp); letter-spacing: .3px; }
+.btn-renew { display: inline-flex; align-items: center; gap: 5px; background: var(--blue-bg); color: var(--blue); border: 1px solid #BFE0F1; padding: 5px 11px; border-radius: 7px; font-size: 0.73rem; font-weight: 700; cursor: pointer; transition: 0.15s; margin-top: 6px; }
+.btn-renew:hover { background: #D3EAF7; }
+
+@media (max-width: 820px) { .parc-preview-list { grid-template-columns: 1fr; } }
 
 /* ── CLASS DETAILS ── */
 .add-student-box { background: var(--paper); padding: 14px; border-radius: 9px; margin-bottom: 18px; border: 1px solid var(--line); }
@@ -377,3 +412,101 @@ input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px 
 .qd-nav .hub-back:hover { color: var(--ink); }
 html.in-shell .standalone-only { display: none !important; }
 @media (max-width: 820px) { .qd-nav .hub-back { position: static; margin-right: 8px; } .qd-nav { justify-content: flex-start; } }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MOBILE — módulo Aulas no celular (a funcionária faz tudo pelo toque).
+   Tudo aqui é só telefone/tablet; o desktop fica intocado.
+   ═══════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 820px) {
+    .layout.qd .content { padding: 12px; }
+
+    /* barra de seções ocupa a largura, alvos maiores */
+    .qd-nav { justify-content: center; padding: 12px 12px 6px; }
+    .qd-pill { width: 100%; }
+    .qd-pill .nav-btn { flex: 1; justify-content: center; min-height: 44px; font-size: 0.92rem; }
+
+    /* placar lado a lado */
+    .qd-stats { gap: 8px; }
+    .qd-stats .stat-item { flex: 1; min-width: 0; }
+
+    /* busca — 16px evita o zoom automático do iOS */
+    .search-bar { padding: 12px 14px; }
+    .search-bar input { font-size: 16px; }
+
+    /* ALUNO vira card vertical, com respiro e toque confortável */
+    .st-row { border-radius: 14px; padding: 13px 14px; row-gap: 0; }
+    .st-name { font-size: 1.2rem; }
+    .st-sub { font-size: 0.82rem; margin-top: 5px; }
+    .st-row .st-pay { padding-top: 11px; margin-top: 2px; border-top: 1px dashed var(--line);
+                      display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .st-pay b { font-size: 1rem; }
+    .st-pay small.parc { font-size: 0.78rem; }
+    .btn-pay { padding: 10px 14px; font-size: 0.82rem; min-height: 42px; }
+    .btn-renew { padding: 10px 14px; font-size: 0.82rem; min-height: 42px; margin-top: 0; }
+    .saldo-box { padding: 6px 12px; }
+    .saldo-box b { font-size: 1.55rem; }
+    /* ações: Gerenciar largo + ícones grandes (sobrescreve o style inline do JS) */
+    .st-row .st-actions { flex-direction: row; align-items: center; gap: 8px; }
+    .st-actions .btn-secondary { flex: 1; min-height: 44px; justify-content: center;
+                                 font-size: 0.8rem !important; padding: 11px !important; }
+    .st-actions .icons { gap: 8px; }
+    .icon-btn { width: 44px; height: 44px; border: 1px solid var(--line); border-radius: 9px; font-size: 1.05rem; }
+    .icon-btn.on { border-color: #CDE8AC; }
+
+    /* MODAIS viram bottom-sheet (sobem de baixo) */
+    .modal-overlay { align-items: flex-end; padding: 0; }
+    .modal-content { max-width: 100% !important; width: 100%; border-radius: 16px 16px 0 0;
+                     max-height: 94vh; animation: sheetUp 0.28s cubic-bezier(0.22, 1, 0.36, 1); }
+    .modal-header { padding: 15px 18px; position: sticky; top: 0; background: var(--white); z-index: 3; }
+    .modal-content form, .modal-body { padding: 16px 18px 26px; }
+    .close { font-size: 1.7rem; padding: 2px 6px; }
+
+    /* campos: 16px + mais altos pro dedo */
+    input, select { font-size: 16px; padding: 13px 14px; }
+    label { font-size: 0.82rem; }
+
+    /* grids de formulário e duplas de campo colapsam */
+    .fg3 { grid-template-columns: 1fr; }
+    .sheet-2col { flex-direction: column; }
+    .class-selector-box { grid-template-columns: 1fr; }
+    .parc-preview-list { grid-template-columns: 1fr; }
+
+    /* parcelas / ações dos modais com toque confortável */
+    .am-btn { padding: 13px 14px; min-height: 52px; }
+    .am-btn .lf { font-size: 1rem; }
+    .am-tile b { font-size: 1.9rem; }
+    .parc-list { max-height: none; }
+
+    /* botões principais maiores e cheios */
+    .btn-primary, .btn-secondary, .btn-save { padding: 13px 18px; min-height: 48px; }
+    .modal-body .btn-primary, .modal-content form .btn-primary { flex: 1; justify-content: center; }
+    .modal-body .btn-secondary, .modal-content form .btn-secondary { flex: 1; justify-content: center; }
+}
+
+@keyframes sheetUp { from { transform: translateY(28px); opacity: .4; } to { transform: translateY(0); opacity: 1; } }
+
+/* ── PISO DE QUALIDADE ── */
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
+
+/* ── TELA DE CARREGAMENTO (mostra até os dados chegarem, ótimo no celular) ── */
+.app-loading {
+    position: fixed; inset: 0; z-index: 4000;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+    background: var(--navy);
+    transition: opacity .35s ease;
+}
+.app-loading.hidden { opacity: 0; pointer-events: none; }
+.app-loading-spin {
+    width: 46px; height: 46px; border-radius: 50%;
+    border: 4px solid rgba(255,255,255,.18);
+    border-top-color: var(--primary);
+    animation: appspin .8s linear infinite;
+}
+.app-loading-txt {
+    font-family: var(--disp); font-weight: 700; letter-spacing: .04em;
+    color: #E9EEF3; font-size: 1.05rem; text-transform: uppercase;
+}
+@keyframes appspin { to { transform: rotate(360deg); } }

@@ -10,7 +10,7 @@
 ; ============================================================
 
 #define AppName "Arena AMP"
-#define AppVersion "3.17"
+#define AppVersion "3.19"
 #define AppPublisher "Fernando Prestes Godinho"
 #define AppExe "Arena AMP.exe"
 ; Precisa BATER com APP_MUTEX em run_desktop.py — é assim que o instalador

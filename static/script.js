@@ -23,10 +23,36 @@ const FILTER_MAP = {
 document.addEventListener('DOMContentLoaded', () => {
     loadAll();
     setTodayDate();
+    trapBackGesture();
 });
 
+// No celular, o gesto "voltar" (deslizar pro lado) NÃO pode deslogar. Se tiver um
+// modal aberto, fecha ele; senão, não sai da tela (mantém o app "preso").
+function trapBackGesture() {
+    try {
+        history.pushState({ amp: 1 }, '');
+        window.addEventListener('popstate', () => {
+            const aberto = Array.from(document.querySelectorAll('.modal-overlay'))
+                .some(m => getComputedStyle(m).display !== 'none');
+            if (aberto && typeof closeModals === 'function') closeModals();
+            history.pushState({ amp: 1 }, '');   // re-prende (nunca sai/desloga)
+        });
+    } catch (e) {}
+}
+
+function hideAppLoading() {
+    document.getElementById('app-loading')?.classList.add('hidden');
+}
+
+// Data de HOJE no fuso LOCAL (não usar toISOString, que é UTC e vira "amanhã"
+// depois das 21h no Brasil — bagunçava a data padrão de início/pagamento).
+function todayLocalISO() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 function setTodayDate() {
-    const today = new Date().toISOString().split('T')[0];
+    const today = todayLocalISO();
     const dateInput = document.getElementById('startDate');
     const paymentDateInput = document.getElementById('paymentDate');
     if (dateInput) { dateInput.value = today; autoCalculateStudentData(); }
@@ -39,38 +65,75 @@ function esc(s) {
 }
 
 // ─── AUTO-CALCULATE ───────────────────────────────────────────────────────────
+const PLANO_MESES = { Mensal: 1, Trimestral: 3, Semestral: 6, Anual: 12 };
+const MESES_LONGOS = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+    'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+
+function planMonths(plan) {
+    if (PLANO_MESES[plan]) return PLANO_MESES[plan];
+    const m = String(plan || '').match(/\d+/);
+    return m ? Math.max(parseInt(m[0]), 1) : 1;
+}
+
+function lastDayOfMonth(y, m) { return new Date(y, m + 1, 0).getDate(); } // m: 0-based
+
+// Espelha o _competencias do backend: [{mesRef:'YYYY-MM', venc:'YYYY-MM-DD'}]
+function competenciasJS(startStr, dia, meses) {
+    if (!startStr) return [];
+    const start = new Date(startStr + 'T12:00:00');
+    let y = start.getFullYear(), m = start.getMonth(); // m 0-based
+    if (start.getDate() > dia) { m++; if (m > 11) { m = 0; y++; } }
+    const out = [];
+    for (let i = 0; i < meses; i++) {
+        const yy = y + Math.floor((m + i) / 12);
+        const mm = (m + i) % 12; // 0-based
+        const d = Math.min(dia, lastDayOfMonth(yy, mm));
+        const mms = String(mm + 1).padStart(2, '0'), ds = String(d).padStart(2, '0');
+        out.push({ mesRef: `${yy}-${mms}`, venc: `${yy}-${mms}-${ds}`, y: yy, m: mm });
+    }
+    return out;
+}
+
 function autoCalculateStudentData() {
     const startInput = document.getElementById('startDate').value;
     const plan = document.getElementById('plan').value;
     const aulasSemana = parseInt(document.getElementById('classesPerWeek').value) || 2;
     const paymentDay = parseInt(document.getElementById('paymentDay').value) || 30;
+    const months = planMonths(plan);
 
-    let months = 1;
-    if (plan === 'Mensal') months = 1;
-    if (plan === 'Trimestral') months = 3;
-    if (plan === 'Semestral') months = 6;
-
-    const semanas = months * 4;
-    document.getElementById('saldoAulas').value = aulasSemana * semanas;
+    document.getElementById('saldoAulas').value = aulasSemana * months * 4;
 
     if (startInput) {
-        const start = new Date(startInput + 'T12:00:00');
-        const endObj = new Date(start);
-        endObj.setMonth(endObj.getMonth() + months);
-        document.getElementById('endDate').value = endObj.toISOString().split('T')[0];
-        document.getElementById('nextPayment').value = computeNextPaymentJS(paymentDay, start);
+        const comps = competenciasJS(startInput, paymentDay, months);
+        if (comps.length) document.getElementById('endDate').value = comps[comps.length - 1].venc;
     }
+    renderParcelaPreview();
 }
 
-function computeNextPaymentJS(paymentDay, referenceDate) {
-    const day = Math.min(paymentDay, 28);
-    let candidate = new Date(referenceDate);
-    candidate.setDate(day);
-    if (candidate <= referenceDate) {
-        candidate.setMonth(candidate.getMonth() + 1);
-        candidate.setDate(day);
-    }
-    return candidate.toISOString().split('T')[0];
+// Prévia das parcelas geradas no cadastro
+function renderParcelaPreview() {
+    const list = document.getElementById('parcPreviewList');
+    const sum = document.getElementById('parcPreviewSum');
+    if (!list) return;
+    const startInput = document.getElementById('startDate').value;
+    const plan = document.getElementById('plan').value;
+    const paymentDay = parseInt(document.getElementById('paymentDay').value) || 30;
+    const price = document.getElementById('price').value.trim() || '0,00';
+    const firstPaid = document.getElementById('firstPaid')?.checked;
+    const months = planMonths(plan);
+    const comps = competenciasJS(startInput, paymentDay, months);
+
+    list.innerHTML = '';
+    comps.forEach((c, i) => {
+        const paid = (i === 0 && firstPaid);
+        const dv = c.venc.slice(8, 10) + '/' + c.venc.slice(5, 7);
+        list.innerHTML += `
+            <div class="parc-preview-item ${paid ? 'paid' : ''}">
+                <span class="pl">${i + 1}ª · ${MESES_LONGOS[c.m]}/${c.y}</span>
+                <span class="pr">${paid ? '<i class="fa-solid fa-check"></i> Paga' : 'vence ' + dv}</span>
+            </div>`;
+    });
+    if (sum) sum.innerText = comps.length ? `${comps.length}x de R$ ${price}` : '';
 }
 
 function enforceClassLimit(checkbox) {
@@ -84,10 +147,13 @@ function enforceClassLimit(checkbox) {
 
 // ─── LOAD ─────────────────────────────────────────────────────────────────────
 async function loadAll() {
-    await fetchClasses();
-    await fetchStudents();
-    await fetchAlerts();
-    await fetchActivity();
+    try {
+        await fetchClasses();          // turmas primeiro (os alunos usam os nomes)
+        await fetchStudents();
+        await Promise.all([fetchAlerts(), fetchActivity()]);  // independentes → em paralelo
+    } finally {
+        hideAppLoading();
+    }
 }
 
 async function fetchClasses() {
@@ -197,15 +263,34 @@ function renderStudentTable() {
 
         let payHtml;
         if (s.active) {
+            const total = s.parcelasTotal || 0;
+            const pagas = s.parcelasPagas || 0;
             const venceClass = s.payment_overdue ? 'over' : '';
-            const paidLine = s.lastPayment
-                ? `<small class="paid"><i class="fa-solid fa-check"></i> Pago ${formatDate(s.lastPayment)}</small>`
-                : '<small>Sem pagamento</small>';
-            payHtml = `
-                <b class="${venceClass}">Vence ${formatDate(s.nextPayment)}</b>
-                <small>todo dia ${s.paymentDay || 30}</small>
-                ${paidLine}
-                <button onclick="openPaymentModal(${s.id})" class="btn-pay" style="margin-top:6px;"><i class="fa-solid fa-money-bill-wave"></i> Registrar Pgto</button>`;
+            if (total > 0) {
+                const resumo = `<small class="parc">${pagas} de ${total} meses pagos</small>`;
+                if (pagas >= total) {
+                    // plano quitado → oferecer renovação
+                    payHtml = `
+                        <b class="paid">Plano quitado</b>
+                        ${resumo}
+                        <button onclick="openRenovarModal(${s.id})" class="btn-renew"><i class="fa-solid fa-rotate"></i> Renovar plano</button>`;
+                } else {
+                    const venceLabel = s.payment_overdue ? 'Vencido desde' : 'Próx. venc';
+                    payHtml = `
+                        <b class="${venceClass}">${venceLabel} ${formatDate(s.nextPayment)}</b>
+                        ${resumo}
+                        <button onclick="openPaymentModal(${s.id})" class="btn-pay" style="margin-top:6px;"><i class="fa-solid fa-money-bill-wave"></i> Registrar Pgto</button>`;
+                }
+            } else {
+                const paidLine = s.lastPayment
+                    ? `<small class="paid"><i class="fa-solid fa-check"></i> Pago ${formatDate(s.lastPayment)}</small>`
+                    : '<small>Sem pagamento</small>';
+                payHtml = `
+                    <b class="${venceClass}">Vence ${formatDate(s.nextPayment)}</b>
+                    <small>todo dia ${s.paymentDay || 30}</small>
+                    ${paidLine}
+                    <button onclick="openPaymentModal(${s.id})" class="btn-pay" style="margin-top:6px;"><i class="fa-solid fa-money-bill-wave"></i> Registrar Pgto</button>`;
+            }
         } else {
             payHtml = '<b>—</b><small>contrato encerrado</small>';
         }
@@ -391,38 +476,206 @@ async function undoHistoryEntry(studentId, historyId, btnEl) {
     }
 }
 
-// ─── PAYMENT MODAL ────────────────────────────────────────────────────────────
+// ─── PAYMENT MODAL (parcelas) ─────────────────────────────────────────────────
+let currentPaymentStudentId = null;
+let selectedParcelaId = null;
+
 function openPaymentModal(studentId) {
     const s = studentsData.find(st => st.id === studentId);
     if (!s) return;
+    currentPaymentStudentId = studentId;
+    selectedParcelaId = null;
     document.getElementById('paymentStudentId').value = s.id;
-    document.getElementById('paymentStudentName').value = s.name;
-    document.getElementById('paymentAmount').value = formatPriceInput(s.price);
-    document.getElementById('paymentDate').value = new Date().toISOString().split('T')[0];
+    renderPaymentModal(s);
     document.getElementById('modalPayment').style.display = 'flex';
 }
 
-async function confirmPayment() {
-    const id = document.getElementById('paymentStudentId').value;
-    const amount = document.getElementById('paymentAmount').value;
+function openRenovarModal(studentId) {
+    openPaymentModal(studentId);
+    toggleRenovPanel(true);
+}
+
+function renderPaymentModal(s) {
+    const mens = s.mensalidades || [];
+    const pagas = mens.filter(m => m.status === 'paga').length;
+    const vencidas = mens.filter(m => m.status === 'vencida').length;
+    const aVencer = mens.filter(m => m.status === 'a_vencer').length;
+
+    let listHtml = mens.map(m => {
+        const comp = `${MESES_LONGOS[parseInt(m.mesRef.slice(5, 7)) - 1]}/${m.mesRef.slice(0, 4)}`;
+        if (m.status === 'paga') {
+            return `
+            <div class="am-btn paga">
+                <span class="lf"><i class="fa-solid fa-circle-check"></i> ${m.numero}ª · ${comp}</span>
+                <span style="display:flex; align-items:center; gap:8px;">
+                    <span class="am-pill">Paga · ${formatDate(m.pagoEm)}</span>
+                    <button class="parc-estorno" onclick="estornarParcela(${m.id})" title="Estornar pagamento"><i class="fa-solid fa-rotate-left"></i></button>
+                </span>
+            </div>`;
+        }
+        const cls = m.status === 'vencida' ? 'venc' : 'aberta';
+        const ic = m.status === 'vencida' ? 'fa-triangle-exclamation' : 'fa-clock';
+        const lbl = (m.status === 'vencida' ? 'Vencida' : 'Vence') + ' · ' + formatDate(m.vencimento);
+        const selCls = (selectedParcelaId === m.id) ? ' sel' : '';
+        return `
+            <div class="am-btn ${cls}${selCls}" onclick="selectParcela(${m.id})">
+                <span class="lf"><i class="fa-solid ${ic}"></i> ${m.numero}ª · ${comp}</span>
+                <span class="am-pill">${lbl}</span>
+            </div>`;
+    }).join('');
+    if (!mens.length) listHtml = '<div style="text-align:center; color:var(--muted); padding:12px; font-size:0.85rem;">Sem parcelas geradas.</div>';
+
+    const body = document.getElementById('paymentModalBody');
+    body.innerHTML = `
+        <input type="hidden" id="paymentStudentId" value="${s.id}">
+        <div class="am-who">
+            <h4>${esc(s.name)}</h4>
+            <div class="am-chip">${esc(s.plan)} · vence dia ${s.paymentDay || 30} · ${formatPrice(s.price)}</div>
+            <div class="am-dates"><i class="fa-regular fa-calendar"></i> Início ${formatDate(s.startDate)} &nbsp;·&nbsp; Fim ${formatDate(s.endDate)}</div>
+        </div>
+        <div class="am-tiles">
+            <div class="am-tile g"><em>Pagas</em><b>${pagas}</b></div>
+            <div class="am-tile ${vencidas > 0 ? 'r' : 'n'}"><em>Vencidas</em><b>${vencidas}</b></div>
+            <div class="am-tile n"><em>A vencer</em><b>${aVencer}</b></div>
+        </div>
+        <div class="am-hist-title" style="margin:14px 0 9px;"><i class="fa-solid fa-layer-group"></i> Parcelas do plano — toque pra dar baixa</div>
+        <div class="parc-list">${listHtml}</div>
+
+        <div class="pay-panel" id="payPanel" style="display:none;">
+            <div class="sec"><i class="fa-solid fa-money-bill-wave"></i> <span id="payPanelTitle">Informar pagamento</span></div>
+            <div class="sheet-2col" style="display:flex; gap:10px;">
+                <div style="flex:1;"><label>Data do pagamento</label><input type="date" id="paymentDate"></div>
+                <div style="flex:1;"><label>Valor recebido (R$)</label><input type="text" id="paymentAmount"></div>
+            </div>
+            <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:12px;">
+                <button class="btn-secondary" onclick="closePayPanel()">Cancelar</button>
+                <button class="btn-primary" onclick="confirmParcelaPayment()"><i class="fa-solid fa-check"></i> Confirmar</button>
+            </div>
+        </div>
+
+        <div class="pay-panel renov" id="renovPanel" style="display:none;">
+            <div class="sec"><i class="fa-solid fa-rotate"></i> Renovar plano — por quantos meses?</div>
+            <div class="sheet-2col" style="display:flex; gap:10px;">
+                <div style="flex:1;">
+                    <label>Duração</label>
+                    <select id="renovMeses">
+                        <option value="1">Mensal — 1 mês</option>
+                        <option value="3">Trimestral — 3 meses</option>
+                        <option value="6" selected>Semestral — 6 meses</option>
+                        <option value="12">Anual — 12 meses</option>
+                    </select>
+                </div>
+                <div style="flex:1;"><label>Valor da mensalidade (R$)</label><input type="text" id="renovValor" value="${formatPriceInput(s.price)}"></div>
+            </div>
+            <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:12px;">
+                <button class="btn-secondary" onclick="toggleRenovPanel(false)">Cancelar</button>
+                <button class="btn-primary" onclick="confirmRenovar()"><i class="fa-solid fa-check"></i> Gerar parcelas</button>
+            </div>
+        </div>
+
+        <div style="text-align:center; margin-top:14px;">
+            <button class="btn-renew" onclick="toggleRenovPanel(true)"><i class="fa-solid fa-rotate"></i> Renovar plano</button>
+        </div>`;
+}
+
+function selectParcela(mid) {
+    selectedParcelaId = mid;
+    const s = studentsData.find(st => st.id === currentPaymentStudentId);
+    const m = (s?.mensalidades || []).find(x => x.id === mid);
+    if (!m) return;
+    renderPaymentModal(s); // re-render marca a parcela selecionada (classe .sel)
+    const comp = `${MESES_LONGOS[parseInt(m.mesRef.slice(5, 7)) - 1]}/${m.mesRef.slice(0, 4)}`;
+    document.getElementById('payPanelTitle').innerText = `Informar pagamento — ${m.numero}ª parcela (${comp})`;
+    document.getElementById('paymentDate').value = todayLocalISO();
+    document.getElementById('paymentAmount').value = formatPriceInput(m.valor || s.price);
+    document.getElementById('payPanel').style.display = 'block';
+    document.getElementById('payPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closePayPanel() {
+    selectedParcelaId = null;
+    const s = studentsData.find(st => st.id === currentPaymentStudentId);
+    if (s) renderPaymentModal(s);
+}
+
+function toggleRenovPanel(show) {
+    const p = document.getElementById('renovPanel');
+    const pay = document.getElementById('payPanel');
+    if (!p) return;
+    if (pay) pay.style.display = 'none';
+    p.style.display = show ? 'block' : 'none';
+    if (show) p.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function confirmParcelaPayment() {
+    const id = currentPaymentStudentId;
     const date = document.getElementById('paymentDate').value;
-    if (!id || !date) return;
-    const btn = document.querySelector('#modalPayment .btn-primary');
+    const amount = document.getElementById('paymentAmount').value;
+    if (!date) { alert('Preencha a data do pagamento.'); return; }
+    const btn = document.querySelector('#payPanel .btn-primary');
+    const orig = btn.innerHTML;
     btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Salvando...';
     btn.disabled = true;
     try {
-        await fetch(`/api/students/${id}/register_payment`, {
+        const res = await fetch(`/api/students/${id}/register_payment`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ paymentDate: date, amount: amount })
+            body: JSON.stringify({ paymentDate: date, amount: amount, mensalidadeId: selectedParcelaId })
         });
-        closeModals();
-        await loadAll();
+        if (!res.ok) { alert(await errMsg(res, 'Erro ao registrar pagamento.')); return; }
+        selectedParcelaId = null;
+        await refreshAndRerenderPayment(id);
     } catch (e) {
-        alert('Erro ao registrar pagamento.');
+        alert('Sem conexão com o sistema. Tente novamente.');
     } finally {
-        btn.innerHTML = 'Confirmar';
+        btn.innerHTML = orig;
         btn.disabled = false;
     }
+}
+
+async function estornarParcela(mid) {
+    if (!confirm('Estornar o pagamento desta parcela? Ela volta a ficar em aberto.')) return;
+    const id = currentPaymentStudentId;
+    try {
+        const res = await fetch(`/api/students/${id}/mensalidades/${mid}/estornar`, { method: 'POST' });
+        if (!res.ok) { alert(await errMsg(res, 'Erro ao estornar.')); return; }
+        await refreshAndRerenderPayment(id);
+    } catch (e) { alert('Sem conexão com o sistema.'); }
+}
+
+async function confirmRenovar() {
+    const id = currentPaymentStudentId;
+    const meses = document.getElementById('renovMeses').value;
+    const valor = document.getElementById('renovValor').value;
+    const btn = document.querySelector('#renovPanel .btn-primary');
+    const orig = btn.innerHTML;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Gerando...';
+    btn.disabled = true;
+    try {
+        const res = await fetch(`/api/students/${id}/renovar`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ meses: parseInt(meses), valor })
+        });
+        if (!res.ok) { alert(await errMsg(res, 'Erro ao renovar.')); return; }
+        await refreshAndRerenderPayment(id);
+    } catch (e) {
+        alert('Sem conexão com o sistema.');
+    } finally {
+        btn.innerHTML = orig;
+        btn.disabled = false;
+    }
+}
+
+async function refreshAndRerenderPayment(id) {
+    await fetchStudents();
+    await fetchAlerts();
+    await fetchActivity();
+    const s = studentsData.find(st => st.id === id);
+    if (s && document.getElementById('modalPayment').style.display === 'flex') renderPaymentModal(s);
+}
+
+async function errMsg(res, fallback) {
+    try { const e = await res.json(); if (e && e.error) return e.error; } catch (_) {}
+    return fallback;
 }
 
 // ─── TOGGLE STATUS ────────────────────────────────────────────────────────────
@@ -483,6 +736,7 @@ function editStudent(id) {
     document.getElementById('nextPayment').value = student.nextPayment || '';
     document.getElementById('saldoAulas').value = student.credits || 0;
     if (document.getElementById('paymentDay')) document.getElementById('paymentDay').value = student.paymentDay || 30;
+    const fp = document.getElementById('firstPaid'); if (fp) fp.checked = false;
     document.getElementById('studentModalTitle').innerText = 'Editar Aluno';
     if (student.class_ids) {
         student.class_ids.forEach(clsId => {
@@ -490,6 +744,7 @@ function editStudent(id) {
             if (cb) cb.checked = true;
         });
     }
+    renderParcelaPreview();
 }
 
 // ─── OPEN STUDENT MODAL ───────────────────────────────────────────────────────
@@ -584,24 +839,26 @@ document.getElementById('studentForm').addEventListener('submit', async (e) => {
             endDate = endObj.toISOString().split('T')[0];
         }
 
+        const firstPaid = document.getElementById('firstPaid')?.checked || false;
         const data = {
             name: document.getElementById('name').value, plan,
             price: document.getElementById('price').value,
             startDate: startInput, endDate, paymentDay,
-            nextPayment: document.getElementById('nextPayment').value,
+            firstPaid,
             lastPayment: document.getElementById('lastPayment').value,
             classesPerWeek: document.getElementById('classesPerWeek').value,
             saldoAulas: document.getElementById('saldoAulas').value, classIds
         };
         const url = isEdit ? `/api/students/${id}/update` : '/api/students';
         const method = isEdit ? 'PUT' : 'POST';
-        await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+        const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+        if (!res.ok) { alert(await errMsg(res, 'Não foi possível salvar o aluno.')); return; }
         closeModals();
         await loadAll();
         e.target.reset();
         setTodayDate();
     } catch (error) {
-        alert('Erro: ' + error.message);
+        alert('Sem conexão com o sistema. Tente novamente.');
     } finally {
         submitBtn.disabled = false;
         submitBtn.innerHTML = originalBtnText;
@@ -765,7 +1022,13 @@ function formatPriceInput(val) {
 function toggleMenu() { document.getElementById('sidebar')?.classList.toggle('active'); }
 function openClassModal() { document.getElementById('modalClass').style.display = 'flex'; }
 function closeModals() { document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none'); }
-function filterStudents() { renderStudentTable(); }
+// Busca com debounce: não re-renderiza a lista inteira a cada tecla (trava no
+// celular). Espera 140ms parar de digitar.
+let _searchTimer = null;
+function filterStudents() {
+    clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(renderStudentTable, 140);
+}
 
 document.querySelectorAll('.modal-overlay').forEach(overlay => {
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModals(); });

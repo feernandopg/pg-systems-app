@@ -5,6 +5,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>{{ arena.arena_name }} · Aulas</title>
+    <!-- Atalho na tela inicial (celular) com a logo da arena -->
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='logo.png') }}">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#132539">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="{{ arena.arena_name }}">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,6 +20,10 @@
 </head>
 <body>
 <script>if (window.self !== window.top) document.documentElement.classList.add('in-shell');</script>
+<div id="app-loading" class="app-loading">
+    <div class="app-loading-spin"></div>
+    <div class="app-loading-txt">Carregando…</div>
+</div>
 
 <div class="layout qd">
     <!-- QUADRA: pílula de seções centralizada (marca/usuário ficam no shell de abas) -->
@@ -108,7 +119,7 @@
                 <label>Nome Completo</label>
                 <input type="text" id="name" required placeholder="Ex: João Silva">
             </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;">
+            <div class="fg3">
                 <div>
                     <label>Plano</label>
                     <select id="plan" required onchange="autoCalculateStudentData()">
@@ -126,17 +137,11 @@
                     <input type="number" id="saldoAulas" required style="background:#F1F8E4; font-weight:700; color:var(--lime-deep);">
                 </div>
             </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+            <div class="fg3">
                 <div>
                     <label>Data de Início</label>
                     <input type="date" id="startDate" required onchange="autoCalculateStudentData()">
                 </div>
-                <div>
-                    <label>Data de Término</label>
-                    <input type="date" id="endDate" required>
-                </div>
-            </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;">
                 <div>
                     <label>Dia fixo de venc.</label>
                     <select id="paymentDay" onchange="autoCalculateStudentData()">
@@ -149,18 +154,27 @@
                     </select>
                 </div>
                 <div>
-                    <label>Próx. Vencimento</label>
-                    <input type="date" id="nextPayment" required>
-                </div>
-                <div>
-                    <label>Último Pagamento</label>
-                    <input type="date" id="lastPayment">
+                    <label>Data de Término <i class="fa-solid fa-lock" style="color:#B4C0CB; font-size:.72rem;" title="Calculada pelo plano"></i></label>
+                    <input type="date" id="endDate" readonly style="background:var(--paper); color:#51657A;">
                 </div>
             </div>
             <div class="form-group">
-                <label>Valor do Plano (R$)</label>
-                <input type="text" id="price" required value="300,00" placeholder="Ex: 59,90">
+                <label>Valor da Mensalidade (R$)</label>
+                <input type="text" id="price" required value="150,00" placeholder="Ex: 150,00" onkeyup="renderParcelaPreview()">
             </div>
+            <label class="check-item" style="cursor:pointer;">
+                <input type="checkbox" id="firstPaid" onchange="renderParcelaPreview()">
+                <span style="font-size:0.86rem; font-weight:600; color:var(--ink);">Cliente já pagou a 1ª mensalidade na matrícula</span>
+            </label>
+            <div class="parc-preview" id="parcPreviewBox">
+                <div class="parc-preview-head">
+                    <span class="parc-preview-title"><i class="fa-solid fa-layer-group"></i> Parcelas que serão geradas</span>
+                    <span class="parc-preview-sum" id="parcPreviewSum"></span>
+                </div>
+                <div class="parc-preview-list" id="parcPreviewList"></div>
+            </div>
+            <input type="hidden" id="nextPayment">
+            <input type="hidden" id="lastPayment">
             <div class="form-group">
                 <label>Turmas (Frequência Fixa)</label>
                 <div class="class-selector-box" id="classSelector"></div>
@@ -242,35 +256,15 @@
     </div>
 </div>
 
-<!-- ═══════════════ MODAL: REGISTRAR PAGAMENTO ═══════════════ -->
+<!-- ═══════════════ MODAL: REGISTRAR PAGAMENTO (parcelas) ═══════════════ -->
 <div id="modalPayment" class="modal-overlay">
-    <div class="modal-content" style="max-width:380px;">
+    <div class="modal-content" style="max-width:460px;">
         <div class="modal-header">
             <h3>Registrar Pagamento</h3>
             <span class="close" onclick="closeModals()">&times;</span>
         </div>
         <div class="modal-body" id="paymentModalBody">
             <input type="hidden" id="paymentStudentId">
-            <div class="form-group" style="margin-bottom:14px;">
-                <label>Aluno</label>
-                <input type="text" id="paymentStudentName" disabled style="background:var(--paper); font-weight:600;">
-            </div>
-            <div class="form-group" style="margin-bottom:14px;">
-                <label>Valor Recebido (R$)</label>
-                <input type="text" id="paymentAmount" placeholder="Ex: 59,90">
-            </div>
-            <div class="form-group" style="margin-bottom:16px;">
-                <label>Data do Pagamento</label>
-                <input type="date" id="paymentDate">
-            </div>
-            <div style="background:var(--lime-bg); border:1px solid #CDE8AC; border-radius:8px; padding:11px; margin-bottom:18px; font-size:0.82rem; color:var(--lime-deep);">
-                <i class="fa-solid fa-circle-info"></i>
-                O próximo vencimento será calculado automaticamente pelo <strong>dia fixo</strong> do aluno.
-            </div>
-            <div style="display:flex; gap:10px; justify-content:flex-end;">
-                <button class="btn-secondary" onclick="closeModals()">Cancelar</button>
-                <button class="btn-primary" onclick="confirmPayment()">Confirmar</button>
-            </div>
         </div>
     </div>
 </div>

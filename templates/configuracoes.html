@@ -118,6 +118,7 @@
     <div class="tabs">
       <button class="tab active" data-tab="identidade"><i class="fa-solid fa-palette"></i> Identidade</button>
       <button class="tab" data-tab="usuarios"><i class="fa-solid fa-users-gear"></i> Usuários</button>
+      <button class="tab" data-tab="remoto"><i class="fa-solid fa-cloud"></i> Nuvem</button>
       <button class="tab" data-tab="backups"><i class="fa-solid fa-database"></i> Backups</button>
       <button class="tab" data-tab="atividade"><i class="fa-solid fa-clock-rotate-left"></i> Atividade</button>
     </div>
@@ -163,6 +164,31 @@
           <thead><tr><th>Usuário</th><th>Papel</th><th>Acesso</th><th style="text-align:right">Ações</th></tr></thead>
           <tbody id="users-body"></tbody>
         </table>
+      </div>
+    </section>
+
+    <!-- ACESSO PELO CELULAR (NUVEM) -->
+    <section class="panel" id="panel-remoto">
+      <div class="card">
+        <h2>Sincronização com a nuvem</h2>
+        <p class="hint">Guarda uma cópia do Aulas na nuvem pra a equipe acessar mesmo com este PC desligado. As mudanças feitas de cada lado se juntam (a mais recente vence).</p>
+        <label style="display:flex;align-items:center;gap:12px;margin:6px 0 14px;cursor:pointer">
+          <input type="checkbox" id="sync-auto" style="width:20px;height:20px">
+          <span style="font-weight:600">Sincronizar automaticamente</span>
+          <span class="hint" style="margin:0">(ao abrir, ao fechar e a cada 5 min)</span>
+        </label>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <button class="btn btn-primary" id="sync-now"><i class="fa-solid fa-rotate"></i> Sincronizar agora</button>
+          <span class="hint" id="sync-msg" style="margin:0"></span>
+        </div>
+        <p class="hint" id="sync-last" style="margin-top:10px"></p>
+        <div id="sync-link-box" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">
+          <p class="hint" style="margin-bottom:8px"><i class="fa-solid fa-mobile-screen"></i> Link da equipe (mande pra funcionária; ela loga com o usuário dela):</p>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <code id="sync-link" style="background:var(--paper);padding:9px 11px;border-radius:8px;font-size:13px;flex:1;min-width:220px;word-break:break-all"></code>
+            <button class="btn btn-ghost" id="sync-link-copy"><i class="fa-solid fa-copy"></i> Copiar</button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -319,6 +345,50 @@
       else toast(d.error||'Erro ao salvar.',true);
     });
 
+    // ── Sincronização com a nuvem (dispara e consulta o status; nunca trava) ──
+    let _syncPoll=null;
+    function _renderSync(d){
+      if($('#sync-auto')) $('#sync-auto').checked = !!d.enabled;
+      if(d.last) $('#sync-last').textContent='Última sincronização: '+d.last;
+      if(d.link){ $('#sync-link').textContent=d.link; $('#sync-link-box').style.display='block'; }
+      else { $('#sync-link-box').style.display='none'; }
+      if(d.status==='running') $('#sync-msg').textContent='Sincronizando com a nuvem... (o 1º pode levar ~40s)';
+      else if(d.status==='error') $('#sync-msg').textContent = d.msg || 'Falhou ao sincronizar.';
+      else if(d.status==='ok' && d.msg) $('#sync-msg').textContent = d.msg;
+    }
+    async function loadSyncAuto(){
+      try{ _renderSync(await (await fetch('/api/sync/auto')).json()); }catch(e){}
+    }
+    function startSyncPoll(){
+      if(_syncPoll) clearInterval(_syncPoll);
+      let tries=0;
+      _syncPoll=setInterval(async()=>{
+        tries++;
+        let d={}; try{ d=await (await fetch('/api/sync/auto')).json(); }catch(e){}
+        _renderSync(d);
+        if(d.status!=='running' || tries>25){ clearInterval(_syncPoll); _syncPoll=null; }
+      },3000);
+    }
+    $('#sync-link-copy')?.addEventListener('click', ()=>{
+      const t=$('#sync-link').textContent;
+      try{ navigator.clipboard.writeText(t); }catch(e){}
+      toast('Link copiado — mande pra funcionária.');
+    });
+    $('#sync-auto')?.addEventListener('change', async e=>{
+      const on=e.target.checked;
+      $('#sync-msg').textContent = on ? 'Ligando...' : 'Desligado.';
+      try{
+        await fetch('/api/sync/auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:on})});
+        if(on) startSyncPoll(); else loadSyncAuto();
+      }catch(err){ e.target.checked=!on; $('#sync-msg').textContent='Erro ao salvar.'; }
+    });
+    $('#sync-now')?.addEventListener('click', async ()=>{
+      $('#sync-msg').textContent='Sincronizando com a nuvem...';
+      try{ await fetch('/api/sync/now',{method:'POST'}); startSyncPoll(); }
+      catch(e){ $('#sync-msg').textContent='Erro ao iniciar.'; }
+    });
+    loadSyncAuto();
+
     // ── Usuários ──
     const modal=$('#user-modal');
     function openModal(u){
@@ -377,23 +447,37 @@
 
     $('#form-user').addEventListener('submit',async e=>{
       e.preventDefault();
+      const btn=$('#um-save');
+      if(btn.disabled) return;                     // evita clique duplo
       const id=$('#um-id').value;
-      const fd=new FormData();
-      fd.append('role',$('input[name=um-role]:checked').value);
-      $$('#um-perms input:checked').forEach(c=>fd.append('perms',c.value));
+      const username=$('#um-username').value.trim();
       const pw=$('#um-password').value;
+      const roleEl=$('input[name=um-role]:checked');
+      const role=roleEl? roleEl.value : 'user';
+      // Validação com feedback (nunca "não acontece nada")
+      if(!id && !username){ toast('Informe um nome de usuário.',true); $('#um-username').focus(); return; }
+      if(!id && !pw){ toast('Defina uma senha.',true); $('#um-password').focus(); return; }
+      const fd=new FormData();
+      fd.append('role',role);
+      $$('#um-perms input:checked').forEach(c=>fd.append('perms',c.value));
       if(pw) fd.append('password',pw);
-      if($('#um-photo').files[0]) fd.append('photo',$('#um-photo').files[0]);
+      const photo=$('#um-photo');
+      if(photo && photo.files && photo.files[0]) fd.append('photo',photo.files[0]);
       let url,method;
       if(id){ url='/api/config/users/'+id; method='PUT'; }
-      else {
-        url='/api/config/users'; method='POST';
-        fd.append('username',$('#um-username').value.trim());
+      else { url='/api/config/users'; method='POST'; fd.append('username',username); }
+      const orig=btn.innerHTML;
+      btn.disabled=true; btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Salvando…';
+      try{
+        const r=await fetch(url,{method,body:fd});
+        let d={}; try{ d=await r.json(); }catch(_){}   // resposta pode não ser JSON (erro 500)
+        if(r.ok){ modal.classList.remove('show'); toast(id?'Usuário atualizado.':'Usuário criado.'); loadUsers(); }
+        else toast(d.error||('Erro ao salvar (código '+r.status+').'),true);
+      }catch(err){
+        toast('Sem conexão com o sistema. Tente novamente.',true);
+      }finally{
+        btn.disabled=false; btn.innerHTML=orig;
       }
-      const r=await fetch(url,{method,body:fd});
-      const d=await r.json();
-      if(r.ok){ modal.classList.remove('show'); toast(id?'Usuário atualizado.':'Usuário criado.'); loadUsers(); }
-      else toast(d.error||'Erro ao salvar.',true);
     });
 
     // ── Backups seg ──
